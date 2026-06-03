@@ -1,0 +1,31 @@
+# Build-context excludes for the DSv4-Flash SFT delivery image (BuildKit reads
+# this file when building with `-f docker/Dockerfile.dsv4_sft`; otherwise it
+# falls back to the repo .dockerignore and the image just ends up larger).
+#
+# The big wins: the top-level .git (~233M) and the submodule object store under
+# .git/modules/3rdparty/Megatron-LM (~113M) — neither is needed at runtime. The
+# submodule WORKING TREE (3rdparty/Megatron-LM/megatron/...) is NOT under .git,
+# so it is still copied.
+.git
+**/.git
+.venv
+venv
+env
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.egg-info
+.ruff_cache
+.pytest_cache
+.mypy_cache
+.coverage
+.coverage.*
+coverage.xml
+.cache
+docs
+.github
+**/*.nemo
+**/*.ckpt
+**/*.safetensors
+**/*.bin
+*.log

@@ -1,0 +1,132 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ==============================================================================
+# DeepSeek-V4-Flash SFT — self-contained delivery image.
+#
+# Reproduces the environment validated end-to-end on 8x GB300 (32 GPU,
+# TP1/PP4/EP8): HF->Megatron import (FP8/MXFP4->bf16) and full SFT with
+# decreasing loss, MTP on and off. Everything is baked in; the launch command
+# is just `srun --container-image=<this> ... run_recipe.py ...` with no runtime
+# dependency bootstrap.
+#
+# Build context requirements (prepare BEFORE `docker build`):
+#   1. This is the Megatron-Bridge repo root with the feat/dsv4-flash-sft recipes.
+#   2. The Megatron-LM submodule (3rdparty/Megatron-LM) must be initialized and
+#      checked out at the VALIDATED main2dev merge commit, which has BOTH the
+#      main-side util `safe_get_world_size` AND the dev-side DSv4 kernels
+#      (csa.py / dsa.py). DSv4 lives on `dev`; the util lives on `main`; only the
+#      periodic `main2dev/*` merges carry both. Use the validated commit (the
+#      build guard below enforces the capability, not the SHA):
+#        git submodule update --init 3rdparty/Megatron-LM
+#        git -C 3rdparty/Megatron-LM fetch origin
+#        git -C 3rdparty/Megatron-LM checkout ed6b1f65502aec7f2fe27e14a1245c29e435c2a6
+#      (= origin/main2dev/27_05_2026, validated on GB300). A newer main2dev tip
+#      MAY work but is unvalidated — re-run the SFT smoke if you bump it.
+#
+# Build:
+#   docker build -f docker/Dockerfile.dsv4_sft -t megatron-bridge:dsv4-sft .
+#
+# For Slurm/Pyxis, convert to an enroot .sqsh (URI is a positional arg):
+#   enroot import -o dsv4_sft.sqsh dockerd://megatron-bridge:dsv4-sft   # local docker daemon
+#   # or, after pushing to a registry:
+#   enroot import -o dsv4_sft.sqsh docker://gitlab-master.nvidia.com:5005/<group>/megatron-bridge:dsv4-sft
+#
+# DSv4 needs fast_hadamard_transform (CSA/DSA indexer imports hadamard_transform
+# on its core forward path and hard-asserts it; no in-tree fallback). It is
+# pinned to the commit validated on GB200/GB300.
+#
+# Offline boundary: code + deps are fully baked, but the recipe builders call
+# AutoBridge/AutoConfig for `deepseek-ai/DeepSeek-V4-Flash` at job start, so the
+# job needs either network OR a pre-populated HF_HOME (config/tokenizer; weights
+# are NOT needed for SFT since it loads the converted Megatron checkpoint). For a
+# truly air-gapped image, COPY a config/tokenizer snapshot and set ENV HF_HOME +
+# HF_HUB_OFFLINE=1.
+#
+# Reproducibility note: for a frozen delivery build, capture `pip freeze` from
+# this image and pin the deps below (esp. datasets/huggingface-hub/hydra-core)
+# to avoid drift against the transformers>=5.8.1,<5.9.0 pin on future rebuilds.
+# ==============================================================================
+
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.04-py3
+FROM ${BASE_IMAGE} AS dsv4_sft
+
+SHELL ["/bin/bash", "-c"]
+# Never read ~/.local: stale x86_64 wheels there break aarch64 native builds
+# (e.g. fast_hadamard) even when PYTHONPATH is set, because pip's build
+# subprocess honors user-site.
+ENV PYTHONNOUSERSITE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 \
+    CUDA_DEVICE_MAX_CONNECTIONS=1
+
+WORKDIR /opt/Megatron-Bridge
+COPY . /opt/Megatron-Bridge
+ENV PYTHONPATH=/opt/Megatron-Bridge/src:/opt/Megatron-Bridge/3rdparty/Megatron-LM
+
+# Fail the build early if the submodule isn't on a DSv4 + util commit. Check BOTH
+# csa.py and dsa.py — the hadamard import + hard-assert + forward call live in
+# dsa.py (csa.py uses it via dsa.rotate_activation), so dsa.py is the file the
+# fast_hadamard dependency is actually consumed by.
+RUN av=3rdparty/Megatron-LM/megatron/core/transformer/experimental_attention_variant && \
+    { test -f "$av/csa.py" && test -f "$av/dsa.py"; } \
+      || { echo "ERROR: mcore submodule missing DSv4 (csa.py/dsa.py). Checkout a main2dev commit."; exit 1; } && \
+    grep -q "def safe_get_world_size" 3rdparty/Megatron-LM/megatron/core/_rank_utils.py \
+      || { echo "ERROR: mcore submodule missing safe_get_world_size (need main2dev, not pure dev)."; exit 1; }
+
+# Python deps validated for DSv4-Flash SFT. numpy<2 matches the build/runtime ABI
+# used in validation. diffusers/imageio/av are required because importing
+# megatron.bridge.recipes pulls the diffusion recipes. energon/modelopt go in
+# --no-deps to avoid clobbering the container's torch/transformers.
+RUN pip install \
+      "numpy<2" omegaconf hydra-core datasets "transformers>=5.8.1,<5.9.0" \
+      huggingface-hub tokenizers safetensors "diffusers>=0.36.0" einops imageio \
+      imageio-ffmpeg pillow tensorboard braceexpand click "multi-storage-client>=0.16.0" \
+      s3fs webdataset bitstring ebmlite filetype sortedcontainers soundfile av pybind11 && \
+    pip install --no-deps "megatron-energon==6.0.1" "nvidia-modelopt==0.44.0"
+
+# fast_hadamard_transform: pinned to the validated commit, built against the
+# container's torch (--no-build-isolation).
+ARG FAST_HADAMARD_COMMIT=f134af63deb2df17e1171a9ec1ea4a7d8604d5ca
+RUN MAX_JOBS=16 pip install --no-build-isolation --no-deps \
+      "git+https://github.com/Dao-AILab/fast-hadamard-transform.git@${FAST_HADAMARD_COMMIT}" && \
+    python -c "from fast_hadamard_transform import hadamard_transform; print('fast_hadamard_transform OK')"
+
+# Optional feature enablers — the supported SFT path (Adam / bf16 / SBHD) does NOT need these;
+# both are validated experimental paths:
+#  * THD / packed-sequence (mcore PR #5011): the DSA THD kernels import `cudnn` (cuDNN-frontend).
+#    Pinned >=1.24.0 and installed --no-deps so it does NOT drag torch/cuBLAS wheels that would
+#    shadow the container CUDA and break Transformer Engine (verified failure mode).
+#  * Muon optimizer: the real implementation lives in the external emerging_optimizers package.
+ARG EMERGING_OPTIMIZERS_REF=v0.2.0
+RUN pip install --no-deps "nvidia-cudnn-frontend>=1.24.0" nvidia-cutlass-dsl && \
+    pip install absl-py && \
+    pip install --no-deps "git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@${EMERGING_OPTIMIZERS_REF}" && \
+    python -c "import cudnn, emerging_optimizers; print('THD (cudnn-frontend) + Muon (emerging_optimizers) deps OK')"
+
+# Pre-build the Megatron-Core C++ dataset helpers. Without this they compile on
+# first use; under a multi-rank job that means N ranks compiling to the same
+# (often networked) path at once, which races and fails ("ld: Stale file handle").
+RUN cd 3rdparty/Megatron-LM/megatron/core/datasets && make && \
+    ls helpers_cpp*.so && \
+    cd /opt/Megatron-Bridge && python -c "import megatron.core.datasets.helpers_cpp; print('helpers_cpp loads OK')"
+
+# Sanity: the package + recipe module import cleanly and the four SFT recipes are
+# exported (validates the mcore/hydra/fast_hadamard chain without a HF download —
+# the recipe builders themselves fetch the HF config, so they run at job start).
+RUN python -c "import megatron.bridge, megatron.bridge.recipes as r; \
+miss=[n for n in ['deepseek_v4_flash_sft_config','deepseek_v4_flash_no_mtp_sft_config','deepseek_v4_flash_sft_blackwell_config','deepseek_v4_flash_no_mtp_sft_blackwell_config'] if not hasattr(r,n)]; \
+assert not miss, f'missing recipes: {miss}'; \
+print('megatron.bridge import OK; DSv4-Flash SFT recipes exported OK')"
