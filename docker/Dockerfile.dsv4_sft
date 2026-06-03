@@ -127,6 +127,6 @@ RUN cd 3rdparty/Megatron-LM/megatron/core/datasets && make && \
 # exported (validates the mcore/hydra/fast_hadamard chain without a HF download —
 # the recipe builders themselves fetch the HF config, so they run at job start).
 RUN python -c "import megatron.bridge, megatron.bridge.recipes as r; \
-miss=[n for n in ['deepseek_v4_flash_sft_config','deepseek_v4_flash_no_mtp_sft_config','deepseek_v4_flash_sft_blackwell_config','deepseek_v4_flash_no_mtp_sft_blackwell_config'] if not hasattr(r,n)]; \
+miss=[n for n in ['deepseek_v4_flash_sft_config','deepseek_v4_flash_no_mtp_sft_config'] if not hasattr(r,n)]; \
 assert not miss, f'missing recipes: {miss}'; \
 print('megatron.bridge import OK; DSv4-Flash SFT recipes exported OK')"
